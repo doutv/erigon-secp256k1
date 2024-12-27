@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be found in
 // the LICENSE file.
 
-// +build !gofuzz cgo
+//go:build !gofuzz && cgo
+// +build !gofuzz,cgo
 
 // Package secp256k1 wraps the bitcoin secp256k1 C library.
 package secp256k1
@@ -20,22 +21,14 @@ package secp256k1
 #  define USE_SCALAR_8X32
 #endif
 
+#ifndef NDEBUG
+#  define NDEBUG
+#endif
+
 #define USE_ENDOMORPHISM
 #define USE_NUM_NONE
 #define USE_FIELD_INV_BUILTIN
 #define USE_SCALAR_INV_BUILTIN
-#if defined(__x86_64__)
-#define USE_FIELD_5X52
-#define USE_SCALAR_4X64
-#define HAVE___INT128
-#else
-#define USE_FIELD_10X26
-#define USE_SCALAR_8X32
-#endif
-#define ECMULT_WINDOW_SIZE 15
-#define ECMULT_GEN_PREC_BITS 4
-#define USE_ENDOMORPHISM
-#define NDEBUG
 #include "./libsecp256k1/src/secp256k1.c"
 #include "./libsecp256k1/src/modules/recovery/main_impl.h"
 #include "ext.h"
@@ -49,47 +42,16 @@ import "C"
 import (
 	"errors"
 	"math/big"
-	"runtime"
 	"unsafe"
 )
 
-type Context struct {
-	context *C.secp256k1_context
-}
-
-var (
-	context            *C.secp256k1_context
-	contextsForThreads []*C.secp256k1_context
-	DefaultContext     *Context // to avoid allocating structures every time on `RecoverPubkey` w/o context
-)
+var context *C.secp256k1_context
 
 func init() {
-	context = initContext()
-	DefaultContext = &Context{context}
-	for i := 0; i < runtime.NumCPU(); i++ {
-		contextsForThreads = append(contextsForThreads, initContext())
-	}
-}
-
-func initContext() *C.secp256k1_context {
 	// around 20 ms on a modern CPU.
-	ctx := C.secp256k1_context_create_sign_verify()
-	C.secp256k1_context_set_illegal_callback(ctx, C.callbackFunc(C.secp256k1GoPanicIllegal), nil)
-	C.secp256k1_context_set_error_callback(ctx, C.callbackFunc(C.secp256k1GoPanicError), nil)
-	return ctx
-}
-
-func ContextForThread(threadNo int) *Context {
-	return &Context{contextsForThreads[threadNo]}
-}
-
-func NumOfContexts() int {
-	return len(contextsForThreads)
-}
-
-func NewContext() *Context {
-	ctx := initContext()
-	return &Context{ctx}
+	context = C.secp256k1_context_create_sign_verify()
+	C.secp256k1_context_set_illegal_callback(context, C.callbackFunc(C.secp256k1GoPanicIllegal), nil)
+	C.secp256k1_context_set_error_callback(context, C.callbackFunc(C.secp256k1GoPanicError), nil)
 }
 
 var (
@@ -144,12 +106,6 @@ func Sign(msg []byte, seckey []byte) ([]byte, error) {
 // sig must be a 65-byte compact ECDSA signature containing the
 // recovery id as the last element.
 func RecoverPubkey(msg []byte, sig []byte) ([]byte, error) {
-	return RecoverPubkeyWithContext(DefaultContext, msg, sig, nil)
-}
-
-// RecoverPubkeyWithContext performs recovery and appends the public key to the given pkbuf
-// If there is enough capacity in pkbuf, no extra allocation is made
-func RecoverPubkeyWithContext(context *Context, msg []byte, sig []byte, pkbuf []byte) ([]byte, error) {
 	if len(msg) != 32 {
 		return nil, ErrInvalidMsgLen
 	}
@@ -157,18 +113,12 @@ func RecoverPubkeyWithContext(context *Context, msg []byte, sig []byte, pkbuf []
 		return nil, err
 	}
 
-	var pubkey []byte
-	if total := len(pkbuf) + 65; cap(pkbuf) >= total {
-		pubkey = pkbuf[:total] // Reuse the space in pkbuf, is it has enough capacity
-	} else {
-		pubkey = make([]byte, total)
-		copy(pubkey, pkbuf)
-	}
 	var (
+		pubkey  = make([]byte, 65)
 		sigdata = (*C.uchar)(unsafe.Pointer(&sig[0]))
 		msgdata = (*C.uchar)(unsafe.Pointer(&msg[0]))
 	)
-	if C.secp256k1_ext_ecdsa_recover(context.context, (*C.uchar)(unsafe.Pointer(&pubkey[len(pkbuf)])), sigdata, msgdata) == 0 {
+	if C.secp256k1_ext_ecdsa_recover(context, (*C.uchar)(unsafe.Pointer(&pubkey[0])), sigdata, msgdata) == 0 {
 		return nil, ErrRecoverFailed
 	}
 	return pubkey, nil
